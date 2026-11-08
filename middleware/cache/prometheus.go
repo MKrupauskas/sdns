@@ -5,6 +5,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/semihalev/sdns/internal/metric"
 	"github.com/semihalev/sdns/middleware"
+	"sync"
 )
 
 // Counters use the internal/metric package (sharded + background
@@ -133,6 +134,7 @@ var (
 
 // cacheInstance holds references to cache components for metrics
 var (
+	metricsMu        sync.RWMutex
 	metricsInstance  *CacheMetrics
 	positiveCacheLen func() int
 	negativeCacheLen func() int
@@ -148,6 +150,8 @@ func init() {
 
 // SetMetricsInstance sets the metrics instance for hit rate calculation
 func SetMetricsInstance(m *CacheMetrics) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
 	metricsInstance = m
 }
 
@@ -156,6 +160,8 @@ func SetMetricsInstance(m *CacheMetrics) {
 // 9520 failure cache, extras[1] the RFC 8020 cut index, and extras[2] the RFC
 // 8198 proof index.
 func SetCacheSizeFuncs(positive, negative func() int, extras ...func() int) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
 	positiveCacheLen = positive
 	negativeCacheLen = negative
 	failureCacheLen = nil
@@ -174,6 +180,8 @@ func SetCacheSizeFuncs(positive, negative func() int, extras ...func() int) {
 
 // UpdateCacheSizeMetrics updates the cache size gauges
 func UpdateCacheSizeMetrics() {
+	metricsMu.RLock()
+	defer metricsMu.RUnlock()
 	if positiveCacheLen != nil {
 		cacheSize.WithLabelValues("positive").Set(float64(positiveCacheLen()))
 	}
@@ -207,6 +215,8 @@ func observeAggressiveNegativeHit(kind middleware.ValidatedNegativeProofKind, rc
 func calculateHitRate() float64 {
 	// Update cache size metrics while calculating hit rate
 	UpdateCacheSizeMetrics()
+	metricsMu.RLock()
+	defer metricsMu.RUnlock()
 
 	if metricsInstance == nil {
 		return 0

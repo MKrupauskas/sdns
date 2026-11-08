@@ -90,7 +90,8 @@ func (r *Resolver) scheduleDelegationRefresh(zone string, cd bool, d *authority.
 		return
 	}
 	job := nsEnrichJob{
-		base: middleware.WithBestEffortRecursionWork(context.Background()),
+		owner: r,
+		base:  middleware.WithBestEffortRecursionWork(r.backgroundContext()),
 		run: func(ctx context.Context) {
 			defer d.ReleaseRefresh()
 			if r.refreshDelegation(ctx, zone, cd, d) {
@@ -133,7 +134,8 @@ func (r *Resolver) maybeRefreshGlue(c *cache.Cache[*glueEntry], host string, qty
 		counters = glueV6Refreshes
 	}
 	job := nsEnrichJob{
-		base: middleware.WithBestEffortRecursionWork(context.Background()),
+		owner: r,
+		base:  middleware.WithBestEffortRecursionWork(r.backgroundContext()),
 		run: func(ctx context.Context) {
 			defer e.mark.SetFlag(false)
 			if r.refreshGlue(ctx, c, e, host, qtype, cd) {

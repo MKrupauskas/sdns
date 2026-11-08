@@ -11,7 +11,10 @@ import (
 
 // SingleflightWrapper wraps singleflight.Group with timeout tracking.
 type SingleflightWrapper struct {
-	group singleflight.Group
+	done        chan struct{}
+	cleanupDone chan struct{}
+	closeOnce   sync.Once
+	group       singleflight.Group
 
 	// generationMu serializes registration with Forget. The underlying
 	// singleflight group protects its own map, but Forget works by key only;
@@ -32,7 +35,9 @@ type singleflightGeneration struct {
 // NewSingleflightWrapper creates a new wrapper with periodic cleanup.
 func NewSingleflightWrapper() *SingleflightWrapper {
 	w := &SingleflightWrapper{
-		current: make(map[string]*singleflightGeneration),
+		done:        make(chan struct{}),
+		cleanupDone: make(chan struct{}),
+		current:     make(map[string]*singleflightGeneration),
 	}
 
 	// Start cleanup goroutine
@@ -87,12 +92,24 @@ func (w *SingleflightWrapper) Forget(key string) {
 
 // cleanupLoop periodically cleans up stuck queries.
 func (w *SingleflightWrapper) cleanupLoop() {
+	defer close(w.cleanupDone)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		w.cleanupStuckQueries()
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-ticker.C:
+			w.cleanupStuckQueries()
+		}
 	}
+}
+
+// Close stops cleanup after users have drained their queries.
+func (w *SingleflightWrapper) Close() {
+	w.closeOnce.Do(func() { close(w.done) })
+	<-w.cleanupDone
 }
 
 // cleanupStuckQueries removes queries that have been running too long.

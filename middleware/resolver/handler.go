@@ -379,12 +379,12 @@ func (h *DNSHandler) TrustAnchors() []dns.RR {
 	return slices.Clone(h.resolver.rootKeys)
 }
 
-// (*DNSHandler).Stop stop gracefully shuts down the resolver.
-func (h *DNSHandler) Stop() {
-	if h.resolver.tcpPool != nil {
-		h.resolver.tcpPool.Close()
-	}
-}
+// Start begins maintenance after the pipeline has wired and restored its handlers.
+// Registry.Build calls it automatically. Direct users must wire dependencies first.
+func (h *DNSHandler) Start() { h.resolver.Start() }
+
+// Stop cancels and joins resolver maintenance. It is safe to call more than once.
+func (h *DNSHandler) Stop() { h.resolver.Stop() }
 
 const name = "resolver"
 

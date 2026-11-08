@@ -55,12 +55,18 @@ type ListenerObserver interface {
 }
 
 // Restorer is implemented by a handler that brings back state an earlier
-// run of the process saved. Setup calls Restore on each after wiring and
-// before publishing the pipeline, so nothing that waits on Ready, the
-// resolver's priming and trust anchor upkeep among it, runs while state is
-// being restored, and no query is served until it is done.
+// run of the process saved. Registry.Build calls Restore after wiring and
+// before starting background work or returning the pipeline to its owner.
 type Restorer interface {
 	Restore()
+}
+
+// Starter is implemented by handlers with background work that requires a
+// complete pipeline. Registry.Build calls Start after all dependency setters
+// and Restore calls finish. Start must return promptly; work it launches must
+// end when the handler's Stop method is called.
+type Starter interface {
+	Start()
 }
 
 // Persister is implemented by a handler that saves state for the next run.

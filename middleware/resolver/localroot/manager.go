@@ -286,7 +286,12 @@ func (m *Manager) Run(ctx context.Context) {
 	serving.Store(m)
 
 	if m.copyPath != "" {
-		go m.writeLoop(ctx)
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			m.writeLoop(ctx)
+		}()
+		defer func() { <-writerDone }()
 	}
 
 	// The first transfer waits out the resolver's own cold start rather

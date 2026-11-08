@@ -339,7 +339,7 @@ func (r *Resolver) AutoTA() {
 	// first successful refresh has published).
 	req.CheckingDisabled = true
 
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(r.netTimeout))
+	ctx, cancel := context.WithDeadline(r.backgroundContext(), time.Now().Add(r.netTimeout))
 	defer cancel()
 	ctx, _ = middleware.EnsureRecursionWork(ctx, r.workPolicy)
 	defer middleware.FinishRecursionWork(ctx)

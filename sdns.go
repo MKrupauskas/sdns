@@ -163,6 +163,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		zlog.Warn("Server shutdown timeout exceeded")
 	}
 
+	middleware.GlobalPipeline().Stop()
 	persistState(middleware.Persist, persistWalk, persistExit)
 
 	// Drain the metric package's final flush so the last interval
