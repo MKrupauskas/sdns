@@ -262,6 +262,10 @@ const (
 
 // NewResolver return a resolver.
 func NewResolver(cfg *config.Config) *Resolver {
+	return newResolver(cfg, true)
+}
+
+func newResolver(cfg *config.Config, background bool) *Resolver {
 	workPolicy := middleware.MustRecursionWorkPolicyFromConfig(cfg.RecursionFirewall)
 
 	r := &Resolver{
@@ -305,7 +309,9 @@ func NewResolver(cfg *config.Config) *Resolver {
 	// the size of the whole query budget (2026-07-28: 1.4M goroutines when
 	// even that shape queued). The fixed pools replace the per-job
 	// goroutines outright; the bounded queues shed under pressure.
-	r.startEnrichPools()
+	if background {
+		r.startEnrichPools()
+	}
 
 	r.probeSlots = make(chan struct{}, maxInflightProbes)
 
@@ -361,8 +367,10 @@ func NewResolver(cfg *config.Config) *Resolver {
 		mgr.Restore()
 	}
 
-	go r.run()
-	go r.pruneLoop()
+	if background {
+		go r.run()
+		go r.pruneLoop()
+	}
 
 	return r
 }

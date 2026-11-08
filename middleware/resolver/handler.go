@@ -57,6 +57,21 @@ var debugns = debugenv.DebugNS()
 
 // New returns a new Handler.
 func New(cfg *config.Config) *DNSHandler {
+	return newHandler(cfg, true)
+}
+
+// NewEmbedded constructs a resolver for an application-owned pipeline without
+// starting SDNS's process-lifetime maintenance or enrichment goroutines. The
+// caller must wire a Queryer with SetQueryer for internal nameserver and alias
+// lookups, and call Stop when done. Config must not be mutated after construction.
+// Root hints are used as supplied: there is no priming, trust-anchor upkeep,
+// local-root refresh, or periodic cache pruning in this mode. Expiry checks and
+// bounded caches still apply. This is intended for short-lived embedding POCs.
+func NewEmbedded(cfg *config.Config) *DNSHandler {
+	return newHandler(cfg, false)
+}
+
+func newHandler(cfg *config.Config, background bool) *DNSHandler {
 	if cfg.Maxdepth == 0 {
 		cfg.Maxdepth = 30
 	}
@@ -66,7 +81,7 @@ func New(cfg *config.Config) *DNSHandler {
 	}
 
 	return &DNSHandler{
-		resolver: NewResolver(cfg),
+		resolver: newResolver(cfg, background),
 		cfg:      cfg,
 	}
 }
