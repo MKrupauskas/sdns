@@ -84,7 +84,10 @@ func (r *Registry) List() []string {
 }
 
 // Build runs every Constructor against cfg, skips disabled middlewares
-// (typed-nil), and returns an immutable Pipeline. Constructors run outside
+// (typed-nil), wires dependencies, restores state, then starts enabled handlers
+// implementing Starter. The returned pipeline is independent of Setup and its
+// global state; the caller owns its lifetime and must call Stop after draining
+// client requests. Constructors run outside
 // the registry lock, so they may do heavy work (open files, spawn
 // goroutines) without starving concurrent List calls.
 func (r *Registry) Build(cfg *config.Config) *Pipeline {
@@ -110,7 +113,15 @@ func (r *Registry) Build(cfg *config.Config) *Pipeline {
 		zlog.Debug("Middleware registered", "name", h.Name(), "index", i)
 	}
 
-	return newPipeline(handlers, byName, order, workPolicy)
+	p := newPipeline(handlers, byName, order, workPolicy)
+	p.autoWire()
+	p.restore()
+	for _, h := range handlers {
+		if s, ok := h.(Starter); ok {
+			s.Start()
+		}
+	}
+	return p
 }
 
 // loadPlugins walks cfg.Plugins, opens each as a Go plugin and registers

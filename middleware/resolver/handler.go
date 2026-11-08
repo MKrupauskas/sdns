@@ -57,21 +57,6 @@ var debugns = debugenv.DebugNS()
 
 // New returns a new Handler.
 func New(cfg *config.Config) *DNSHandler {
-	return newHandler(cfg, true)
-}
-
-// NewEmbedded constructs a resolver for an application-owned pipeline without
-// starting SDNS's process-lifetime maintenance or enrichment goroutines. The
-// caller must wire a Queryer with SetQueryer for internal nameserver and alias
-// lookups, and call Stop when done. Config must not be mutated after construction.
-// Root hints are used as supplied: there is no priming, trust-anchor upkeep,
-// local-root refresh, or periodic cache pruning in this mode. Expiry checks and
-// bounded caches still apply. This is intended for short-lived embedding POCs.
-func NewEmbedded(cfg *config.Config) *DNSHandler {
-	return newHandler(cfg, false)
-}
-
-func newHandler(cfg *config.Config, background bool) *DNSHandler {
 	if cfg.Maxdepth == 0 {
 		cfg.Maxdepth = 30
 	}
@@ -81,7 +66,7 @@ func newHandler(cfg *config.Config, background bool) *DNSHandler {
 	}
 
 	return &DNSHandler{
-		resolver: newResolver(cfg, background),
+		resolver: NewResolver(cfg),
 		cfg:      cfg,
 	}
 }
@@ -394,12 +379,12 @@ func (h *DNSHandler) TrustAnchors() []dns.RR {
 	return slices.Clone(h.resolver.rootKeys)
 }
 
-// (*DNSHandler).Stop stop gracefully shuts down the resolver.
-func (h *DNSHandler) Stop() {
-	if h.resolver.tcpPool != nil {
-		h.resolver.tcpPool.Close()
-	}
-}
+// Start begins maintenance after the pipeline has wired and restored its handlers.
+// Registry.Build calls it automatically. Direct users must wire dependencies first.
+func (h *DNSHandler) Start() { h.resolver.Start() }
+
+// Stop cancels and joins resolver maintenance. It is safe to call more than once.
+func (h *DNSHandler) Stop() { h.resolver.Stop() }
 
 const name = "resolver"
 

@@ -37,8 +37,13 @@ var (
 func (r *Resolver) pruneLoop() {
 	ticker := time.NewTicker(resolverPruneInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		r.pruneCaches()
+	for {
+		select {
+		case <-r.backgroundContext().Done():
+			return
+		case <-ticker.C:
+			r.pruneCaches()
+		}
 	}
 }
 

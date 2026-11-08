@@ -108,3 +108,37 @@ plain function into a `Handler`, which is enough for the stub.
 
 No assertion library and no network; see
 [Building and testing]({{ '/docs/development/building/' | relative_url }}).
+
+## Owning an independent pipeline
+
+Embedders use the same `config.Config`, middleware constructors, and
+`Registry.Build` as the server. `Build` wires the internal queryers and stores,
+restores saved state, then calls `Starter.Start` on enabled handlers. It does
+not publish the pipeline globally or depend on `middleware.Ready()`.
+
+A resolver constructed with `resolver.New(cfg)` keeps its normal priming,
+trust-anchor upkeep, pruning, and enrichment behavior. Its maintenance begins
+when the owning pipeline starts it. Direct users of `NewResolver` call `Start`
+after wiring dependencies. Constructors no longer start resolver network
+maintenance against a partially built pipeline.
+
+To execute queries in memory, use `middleware.NewPipelineQueryer(pipeline)`.
+Callers own their request messages; copy a message first if another component
+still needs it. Include the cache and EDNS middlewares when you need CNAME
+completion, caching, DNSSEC response policy, and EDNS handling. The host owns its
+listeners and client admission; it must enforce its final transport size limit.
+
+At shutdown, stop accepting queries and cancel or drain active calls, then call
+`pipeline.Stop()`. It stops handlers once in reverse order. The resolver cancels
+and joins maintenance, active enrichment, singleflight leaders and upstream
+attempts, and closes its cleanup loops and pooled TCP connections. Shared
+bounded enrichment workers remain process-wide; they skip queued jobs owned by
+a stopped resolver. `pipeline.Persist(ctx)` saves the instance's state after
+shutdown without referring to the global pipeline. Do not stop a sub-pipeline:
+its handlers belong to the original owning pipeline.
+
+A pipeline and its handler instances have one lifetime. A reload constructs a
+new pipeline from ordinary configuration; a stopped instance cannot restart.
+Independent instances may coexist, including during a host's configuration
+reload. Give independently managed persistent instances separate state
+directories.

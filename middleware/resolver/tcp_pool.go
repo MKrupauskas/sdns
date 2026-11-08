@@ -11,7 +11,10 @@ import (
 
 // TCPConnPool manages persistent TCP connections to DNS servers.
 type TCPConnPool struct {
-	mu sync.RWMutex
+	done        chan struct{}
+	cleanupDone chan struct{}
+	closed      bool // protected by mu
+	mu          sync.RWMutex
 
 	// Separate pools for different server levels
 	rootConns map[string]*pooledConn // Level 0 - root servers
@@ -51,6 +54,8 @@ func NewTCPConnPool(rootTimeout, tldTimeout time.Duration, maxConns int) *TCPCon
 	}
 
 	pool := &TCPConnPool{
+		done:        make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 		rootConns:   make(map[string]*pooledConn),
 		tldConns:    make(map[string]*pooledConn),
 		rootTimeout: rootTimeout,
@@ -68,6 +73,9 @@ func NewTCPConnPool(rootTimeout, tldTimeout time.Duration, maxConns int) *TCPCon
 func (p *TCPConnPool) Get(server string, isRoot, isTLD bool) *dns.Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
 
 	var conn *pooledConn
 	var exists bool
@@ -123,7 +131,7 @@ func (p *TCPConnPool) Put(conn *dns.Conn, server string, isRoot, isTLD bool, msg
 	defer p.mu.Unlock()
 
 	// Check connection limit
-	if p.active >= p.maxConns {
+	if p.closed || p.active >= p.maxConns {
 		// Pool is full, close the connection
 		conn.Close() //nolint:gosec // G104 - connection cleanup
 		return
@@ -202,11 +210,17 @@ func (p *TCPConnPool) getPoolMap(isRoot, isTLD bool) map[string]*pooledConn {
 
 // cleanupLoop periodically removes expired connections.
 func (p *TCPConnPool) cleanupLoop() {
+	defer close(p.cleanupDone)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		p.cleanup()
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-ticker.C:
+			p.cleanup()
+		}
 	}
 }
 
@@ -248,7 +262,13 @@ func (p *TCPConnPool) Stats() (hits, misses int64, active int) {
 // (*TCPConnPool).Close close closes all connections in the pool.
 func (p *TCPConnPool) Close() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed {
+		p.mu.Unlock()
+		<-p.cleanupDone
+		return
+	}
+	p.closed = true
+	close(p.done)
 
 	for _, conn := range p.rootConns {
 		conn.Close() //nolint:gosec // G104 - connection cleanup
@@ -260,6 +280,8 @@ func (p *TCPConnPool) Close() {
 	p.rootConns = make(map[string]*pooledConn)
 	p.tldConns = make(map[string]*pooledConn)
 	p.active = 0
+	p.mu.Unlock()
+	<-p.cleanupDone
 }
 
 // SetEDNSKeepalive adds EDNS-Keepalive option to a message.

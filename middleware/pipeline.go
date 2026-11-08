@@ -21,6 +21,7 @@ type Pipeline struct {
 	names      []string // full registered name list, including disabled
 	workPolicy RecursionWorkPolicy
 	chainPool  sync.Pool
+	stopOnce   sync.Once
 }
 
 // newPipeline constructs a Pipeline and initialises its chain pool.
@@ -193,19 +194,24 @@ func Setup(cfg *config.Config) {
 
 	DefaultRegistry.loadPlugins(cfg)
 	p := DefaultRegistry.Build(cfg)
-	// Auto-wire BEFORE publishing the pipeline. The resolver's
-	// background priming goroutine spins on middleware.Ready() and
-	// starts issuing sub-queries the instant it returns true; if
-	// we published before wiring, the goroutine would race the
-	// queryer/store field writes here. Publishing after wiring
-	// means the atomic.Pointer.Store also acts as a happens-before
-	// barrier for every field the goroutine subsequently reads.
-	p.autoWire()
-	// Saved state comes back after wiring, which a restore may depend on,
-	// and before publishing, which is what lets queries and the resolver's
-	// background upkeep in: neither can race it or see it half done.
-	p.restore()
+	// Build wires and restores the instance before starting maintenance.
 	globalPipeline.Store(p)
+}
+
+// Stop releases handlers' long-lived resources in reverse pipeline order, once.
+// Stop accepting and drain client requests before calling it. Only stop the
+// owning pipeline, not a SubPipeline, whose handlers belong to its parent.
+func (p *Pipeline) Stop() {
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(func() {
+		for i := len(p.handlers) - 1; i >= 0; i-- {
+			if s, ok := p.handlers[i].(interface{ Stop() }); ok {
+				s.Stop()
+			}
+		}
+	})
 }
 
 // cacheHandlerName is the registered name of the cache middleware,
@@ -357,6 +363,12 @@ func (p *Pipeline) restore() {
 // have stopped; before Setup it does nothing.
 func Persist(ctx context.Context) {
 	p := globalPipeline.Load()
+	p.Persist(ctx)
+}
+
+// Persist saves this pipeline's state without depending on the global instance.
+// Call after draining clients and stopping background work at shutdown.
+func (p *Pipeline) Persist(ctx context.Context) {
 	if p == nil {
 		return
 	}

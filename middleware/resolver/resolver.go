@@ -34,6 +34,14 @@ import (
 type Resolver struct {
 	sync.RWMutex
 
+	background       context.Context
+	cancelBackground context.CancelFunc
+	lifecycleMu      sync.Mutex
+	started          bool
+	stopped          bool
+	backgroundWG     sync.WaitGroup
+	stopOnce         sync.Once
+
 	delegations *authority.Cache
 
 	cfg *config.Config
@@ -116,13 +124,8 @@ type Resolver struct {
 	// middleware.Setup via StoreSetter; nil-safe for tests that
 	// construct a Resolver directly.
 	//
-	// atomic.Pointer because r.run() starts a background goroutine
-	// from NewResolver that issues priming sub-queries the instant
-	// middleware.Ready() returns true, and the auto-wire write
-	// happens after NewResolver returns. Production sequences the
-	// autoWire() call before globalPipeline.Store, but tests
-	// construct fresh Resolvers outside that flow and need the
-	// atomic barrier for correctness under -race.
+	// Atomic publication also supports directly constructed resolvers. The
+	// owning pipeline wires dependencies before starting maintenance.
 	store atomic.Pointer[middleware.Store]
 
 	// queryer drives policy-aware internal lookups (NS A/AAAA, DNAME
@@ -260,12 +263,9 @@ const (
 	probeGrace = 250 * time.Millisecond
 )
 
-// NewResolver return a resolver.
+// NewResolver constructs a resolver. Start begins maintenance once dependencies
+// have been wired; Stop releases its resources after client queries drain.
 func NewResolver(cfg *config.Config) *Resolver {
-	return newResolver(cfg, true)
-}
-
-func newResolver(cfg *config.Config, background bool) *Resolver {
 	workPolicy := middleware.MustRecursionWorkPolicyFromConfig(cfg.RecursionFirewall)
 
 	r := &Resolver{
@@ -287,6 +287,7 @@ func newResolver(cfg *config.Config, background bool) *Resolver {
 	}
 
 	r.qnameMinCount, r.qnameMinOneLabel = cfg.QnameMinimizeParams()
+	r.background, r.cancelBackground = context.WithCancel(context.Background())
 
 	// Set default for MaxConcurrentQueries if not configured
 	maxConcurrent := cfg.MaxConcurrentQueries
@@ -309,9 +310,7 @@ func newResolver(cfg *config.Config, background bool) *Resolver {
 	// the size of the whole query budget (2026-07-28: 1.4M goroutines when
 	// even that shape queued). The fixed pools replace the per-job
 	// goroutines outright; the bounded queues shed under pressure.
-	if background {
-		r.startEnrichPools()
-	}
+	r.startEnrichPools()
 
 	r.probeSlots = make(chan struct{}, maxInflightProbes)
 
@@ -365,11 +364,6 @@ func newResolver(cfg *config.Config, background bool) *Resolver {
 	}
 	if mgr := r.localRoot.Load(); mgr != nil {
 		mgr.Restore()
-	}
-
-	if background {
-		go r.run()
-		go r.pruneLoop()
 	}
 
 	return r
@@ -702,6 +696,10 @@ func (r *Resolver) groupLookup(ctx context.Context, rs *resolveState, req *dns.M
 		// returns its own error while the remaining healthy followers regroup
 		// again; each caller's context bounds the sequence.
 		result, shared, leader, lookupErr := r.sfGroup.TimedDoChanWithRole(ctx, key, func() (any, error) {
+			if !r.beginBackground() {
+				return nil, context.Canceled
+			}
+			defer r.backgroundWG.Done()
 			// Hard ceiling on in-flight zone lookups, held only for this
 			// wire-level lookup, never across recursion levels, so a
 			// nested sub-lookup can't deadlock on its parent's slot. When
@@ -1012,8 +1010,9 @@ const (
 // something an outage accumulates. Its work runs under its own ledger,
 // bounded by the fixed workers, the per-job timeout and the queue cap.
 type nsEnrichJob struct {
-	base context.Context
-	run  func(ctx context.Context)
+	base  context.Context
+	run   func(ctx context.Context)
+	owner *Resolver
 }
 
 // The lanes are process-wide and started exactly once: a lane is
@@ -1041,9 +1040,15 @@ func ensureEnrichPools() (v4, v6, refresh chan nsEnrichJob) {
 			for range nsEnrichWorkers {
 				go func(jobs chan nsEnrichJob) {
 					for job := range jobs {
+						if job.owner != nil && !job.owner.beginBackground() {
+							continue
+						}
 						ctx, cancel := context.WithTimeout(job.base, 30*time.Second)
 						job.run(ctx)
 						cancel()
+						if job.owner != nil {
+							job.owner.backgroundWG.Done()
+						}
 					}
 				}(lane)
 			}
@@ -1836,7 +1841,15 @@ mainloop:
 		select {
 		case r.maxConcurrent <- struct{}{}:
 			// Got a slot, start the query
-			go r.queryServer(ctx, rs, interrupts, originalID, serverReq, server, results, server == probing)
+			if !r.beginBackground() {
+				<-r.maxConcurrent
+				ReleaseMsg(serverReq)
+				return nil, context.Canceled
+			}
+			go func() {
+				defer r.backgroundWG.Done()
+				r.queryServer(ctx, rs, interrupts, originalID, serverReq, server, results, server == probing)
+			}()
 		case <-ctx.Done():
 			// Context cancelled while waiting for slot,
 			// return the pre-copied pooled message before
@@ -2121,6 +2134,8 @@ func (r *Resolver) queryServer(ctx context.Context, rs *resolveState, interrupts
 				// no longer than any other attempt.
 				var release context.CancelFunc
 				exchangeCtx, release = context.WithTimeout(context.WithoutCancel(ctx), r.netTimeout+probeGrace)
+				stopOnShutdown := context.AfterFunc(r.backgroundContext(), release)
+				defer stopOnShutdown()
 				defer release()
 				exchangeCtx = withProbeMode(exchangeCtx)
 
@@ -3448,7 +3463,7 @@ addrsloop:
 func (r *Resolver) enqueueV4Enrich(ctx context.Context, q dns.Question, authservers *authority.Servers, key uint64, parentDS []dns.RR, names []string, cd bool, cut lease.Lease) {
 	guard := middleware.ResolutionAttemptGuardFrom(ctx)
 	reqid := requestIDFromContext(ctx)
-	detachedBase := dnssec.InheritNSEC3HashMemos(context.Background(), ctx)
+	detachedBase := dnssec.InheritNSEC3HashMemos(r.backgroundContext(), ctx)
 	if middleware.HasClientECS(ctx) {
 		detachedBase = middleware.MarkClientECS(detachedBase)
 	}
@@ -3457,7 +3472,8 @@ func (r *Resolver) enqueueV4Enrich(ctx context.Context, q dns.Question, authserv
 	}
 
 	enqueueEnrich(r.v4Enrich, nsEnrichJob{
-		base: detachedBase,
+		owner: r,
+		base:  detachedBase,
 		run: func(jobCtx context.Context) {
 			// The roster is optional work like the v6 side: it stops at the
 			// shared cap, and its rejected debits must not poison the
@@ -3839,7 +3855,7 @@ func (r *Resolver) checkPriming() {
 	req.SetEdns0(dnsutil.DefaultMsgSize, true)
 	req.CheckingDisabled = !r.dnssec
 
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(r.netTimeout))
+	ctx, cancel := context.WithDeadline(r.backgroundContext(), time.Now().Add(r.netTimeout))
 	defer cancel()
 
 	if len(r.rootServers.List) == 0 {
@@ -3936,11 +3952,6 @@ func (r *Resolver) checkPriming() {
 }
 
 func (r *Resolver) run() {
-	for !middleware.Ready() {
-		// wait middleware setup
-		time.Sleep(50 * time.Millisecond)
-	}
-
 	r.checkPriming() // update root server list from priming query
 	if r.dnssec {
 		r.AutoTA() // RFC 5011 automated trust anchor updates
@@ -3948,15 +3959,26 @@ func (r *Resolver) run() {
 	if mgr := r.localRoot.Load(); mgr != nil {
 		// After AutoTA: the first transfer verifies against the loaded
 		// anchors. The manager owns its schedule from here.
-		go mgr.Run(context.Background())
+		if r.beginBackground() {
+			go func() {
+				defer r.backgroundWG.Done()
+				mgr.Run(r.backgroundContext())
+			}()
+		}
 	}
 
 	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
 
-	for range ticker.C {
-		r.checkPriming()
-		if r.dnssec {
-			r.AutoTA()
+	for {
+		select {
+		case <-r.backgroundContext().Done():
+			return
+		case <-ticker.C:
+			r.checkPriming()
+			if r.dnssec {
+				r.AutoTA()
+			}
 		}
 	}
 }
@@ -4404,7 +4426,7 @@ func (r *Resolver) processDelegation(ctx context.Context, rs *resolveState, resp
 		reqid := requestIDFromContext(ctx)
 		attemptGuard := middleware.ResolutionAttemptGuardFrom(ctx)
 		detachedBase := dnssec.InheritNSEC3HashMemos(
-			context.Background(),
+			r.backgroundContext(),
 			ctx,
 		)
 		if middleware.HasClientECS(ctx) {
@@ -4418,7 +4440,8 @@ func (r *Resolver) processDelegation(ctx context.Context, rs *resolveState, resp
 		// lane sheds the job, enrichment is optional work, and shedding
 		// it under pressure is strictly better than becoming the pressure.
 		enqueueEnrich(r.v6Enrich, nsEnrichJob{
-			base: detachedBase,
+			owner: r,
+			base:  detachedBase,
 			run: func(jobCtx context.Context) {
 				if attemptGuard != nil {
 					jobCtx = middleware.WithResolutionAttemptGuard(jobCtx, attemptGuard)
